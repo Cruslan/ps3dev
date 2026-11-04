@@ -1,0 +1,36 @@
+diff --git a/ppu/librsx/buffer_impl.h b/ppu/librsx/buffer_impl.h
+index b6aaf93..23ff928 100644
+--- a/ppu/librsx/buffer_impl.h
++++ b/ppu/librsx/buffer_impl.h
+@@ -20,8 +20,13 @@ void RSX_FUNC(ResetCommandBuffer)(gcmContextData *context)
+ 	RSX_FUNC(FlushBuffer)(context);
+ 
+ 	gcmControlRegister volatile *ctrl = gcmGetControlRegister(context);
+-	while(ctrl->get != offset) usleep(30);
++	uint32_t spins = 0;
++	while(ctrl->get != offset && spins < 100000) {
++		usleep(30);
++		spins++;
++	}
+ 
++	__sync();
+ 	ctrl->put = offset;
+ 
+ 	/* Synchronize host write pointer back to the buffer start */
+diff --git a/ppu/librsx/init.c b/ppu/librsx/init.c
+index fa673e3..45e997f 100644
+--- a/ppu/librsx/init.c
++++ b/ppu/librsx/init.c
+@@ -20,11 +20,7 @@ s32 rsxInit(gcmContextData **context,u32 cmdSize,u32 ioSize,const void *ioAddres
+ 
+ 	ret = gcmInitBodyEx(&gGcmContext,cmdSize,ioSize,ioAddress);
+ 	if(ret==0) {
+-		u32 maxCmdSize = (ioSize > 0x1000) ? (ioSize - 0x1000) : 0;
+-		if(cmdSize > 0x7000 && cmdSize <= maxCmdSize && gGcmContext != NULL) {
+-			gGcmContext->end = (u32*)((uintptr_t)(void*)gGcmContext->begin + (cmdSize & ~0x3) - 4);
+-		}
+-
++	
+ 		rsxHeapInit();
+ 
+ 		if (context)

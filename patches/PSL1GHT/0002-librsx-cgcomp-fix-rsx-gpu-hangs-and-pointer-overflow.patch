@@ -1,0 +1,329 @@
+From b7c7ed978f04bea20a4c6abbf763d31940142e60 Mon Sep 17 00:00:00 2001
+From: Cruslan <147114339+Cruslan@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 02:15:30 +0300
+Subject: [PATCH 2/2] librsx, cgcomp: Fix RSX GPU hangs, pointer arithmetic
+ overflows, and texcoords handling
+
+- Fix pointer scaling overflow in rsxSetupContextData by casting addr to uintptr_t before adding byte length.
+- Add allowTex (bit 15) flag in compilerfp.cpp and LoadFragmentProgramLocation when fragment program samples textures.
+- Correct SetVertexProgramConstants second burst source offset to &value[16] instead of value.
+- Fix SetTimeStamp writing outside allocated packet bounds (currenp[1] instead of [2]).
+- Fix ResetCommandBuffer to query real buffer start offset via gcmAddressToOffset and rewind context->current.
+- Fix rsxContextCallback assembly calling convention to preserve registers across 32-bit OPD invocations.
+- Add missing vdec codec defines in vdec.h.
+---
+ ppu/include/codec/vdec.h              |  6 +++-
+ ppu/include/rsx/gcm_sys.h             |  1 +
+ ppu/include/rsx/rsx_function_macros.h | 52 ++++++++++++++++++++-------
+ ppu/librsx/buffer_impl.h              | 26 +++++++++++---
+ ppu/librsx/commands_impl.h            | 31 +++++-----------
+ ppu/librsx/init.c                     | 26 ++++++++++++--
+ tools/cgcomp/source/compilerfp.cpp    |  2 ++
+ 7 files changed, 103 insertions(+), 41 deletions(-)
+
+diff --git a/ppu/include/codec/vdec.h b/ppu/include/codec/vdec.h
+index 62351e2..dc3ffc6 100644
+--- a/ppu/include/codec/vdec.h
++++ b/ppu/include/codec/vdec.h
+@@ -159,7 +159,8 @@ typedef struct _vdec_h264_info
+ 	u16 sar_height;
+ 	u16 sar_width;
+ 	u8  pic_struct;
+-	s8  pic_order_count[2];
++	u8  _pad0;
++	s16 pic_order_count[2];
+ 	bool vui_parameters_present_flag;
+ 	bool frame_mbs_only_flag;
+ 	bool video_signal_type_present_flag;
+@@ -175,6 +176,9 @@ typedef struct _vdec_h264_info
+ 	bool low_delay_hrd_flag;
+ 	bool entropy_coding_mode_flag;
+ 	u16 nalUnitPresentFlags;
++	u8  ccDataLength[2];
++	u8  ccData[2][128];
++	u64 reserved[2];
+ } vdecH264Info;
+ 
+ typedef u32 (*vdecCallback)(u32 handle,u32 msgtype,u32 msgdata,u32 arg);
+diff --git a/ppu/include/rsx/gcm_sys.h b/ppu/include/rsx/gcm_sys.h
+index 18876f2..4ef9b74 100644
+--- a/ppu/include/rsx/gcm_sys.h
++++ b/ppu/include/rsx/gcm_sys.h
+@@ -284,6 +284,7 @@
+ #define GCM_TEXTURE_FORMAT_R5G6B5A1					23
+ /*! \brief texture color format is two 16-bit unsigned values compressed to two 8-bit values */
+ #define GCM_TEXTURE_FORMAT_COMPRESSED_HILO8			24
++#define GCM_TEXTURE_FORMAT_A8L8						24
+ /*! \brief texture color format is two 16-bit signed values compressed to two 8-bit values */
+ #define GCM_TEXTURE_FORMAT_COMPRESSED_HILO8_S8		25
+ /*! \brief texture color format is four 16-bit float values */
+diff --git a/ppu/include/rsx/rsx_function_macros.h b/ppu/include/rsx/rsx_function_macros.h
+index bffc3a1..f4c5245 100644
+--- a/ppu/include/rsx/rsx_function_macros.h
++++ b/ppu/include/rsx/rsx_function_macros.h
+@@ -12,21 +12,49 @@
+ 	#define RSX_FUNC_INTERNAL(func)		__rsx##func##Unsafe
+ 	#define RSX_CONTEXT_CURRENT_BEGIN(count) do {} while(0)	
+ #else
+-	s32 __attribute__((noinline)) rsxContextCallback(gcmContextData *context,u32 count)
++	/**
++	 * @brief Dispatches the GCM command buffer wrap callback handler.
++	 *
++	 * When the command buffer current write pointer reaches or exceeds the end
++	 * threshold, this function executes the user-registered callback handler via
++	 * its 32-bit Procedure Descriptor (OPD).
++	 *
++	 * Architectural & ABI Invariants:
++	 * - PowerPC 64-bit ELF ABI passes argument 1 (context) in r3 and argument 2 (count) in r4.
++	 * - The callback returns an s32 status code in r3 (0 = success, non-zero = fail).
++	 * - A 32-bit OPD descriptor layout places the 32-bit function entry address at offset 0
++	 *   and the 32-bit callee Table of Contents (TOC) register value at offset 4.
++	 * - Callers must preserve their own TOC (r2) across indirect calls; offset 40(r1) is the
++	 *   standard ABI TOC save slot in the caller's 128-byte stack frame.
++	 * - The called C function is permitted to clobber all volatile registers (r0, r4-r12,
++	 *   lr, ctr, xer, cr0-cr1, cr5-cr7) and read/write arbitrary system memory. A full
++	 *   volatile clobber list and "memory" clobber are mandatory to prevent compiler
++	 *   register reuse and unsafe caching across the ring wrap boundary.
++	 *
++	 * @param context Pointer to the active RSX GCM context structure.
++	 * @param count Number of 32-bit command words requested for reservation.
++	 * @return s32 0 on success, non-zero if the buffer could not be reset.
++	 */
++	s32 __attribute__((noinline)) rsxContextCallback(gcmContextData *context, u32 count)
+ 	{
+ 		register s32 result asm("r3");
++		register gcmContextData *r3_ctx asm("r3") = context;
++		register u32 r4_cnt asm("r4") = count;
++		register void *r12_cb asm("r12") = (void *)context->callback;
++
+ 		__asm__ __volatile__ (
+-            "stdu	1,-128(1)\n"
+-            "mr		31,2\n"
+-            "lwz	0,0(%3)\n"
+-            "lwz	2,4(%3)\n"
+-            "mtctr	0\n"
+-            "bctrl\n"
+-            "mr		2,31\n"
+-            "addi	1,1,128\n"
+-            : "+r"(result)
+-            : "r"(context), "r"(count), "b"(context->callback)
+-            : "r31", "r0", "lr"
++			"stdu	1,-128(1)\n"		/* Allocate 128-byte ABI frame and update backchain */
++			"std	2,40(1)\n"			/* Save caller's TOC in standard ABI slot 40(r1) */
++			"lwz	0,0(%3)\n"			/* Load 32-bit function entry point from OPD */
++			"lwz	2,4(%3)\n"			/* Load 32-bit callee TOC into r2 */
++			"mtctr	0\n"				/* Move target entry address to Count Register */
++			"bctrl\n"					/* Branch to callback with link (r3=ctx, r4=count) */
++			"ld		2,40(1)\n"			/* Restore caller's original TOC from slot 40(r1) */
++			"addi	1,1,128\n"			/* Deallocate 128-byte ABI frame */
++			: "=r"(result), "+r"(r4_cnt)
++			: "0"(r3_ctx), "b"(r12_cb)
++			: "r0", "r5", "r6", "r7", "r8", "r9", "r10", "r11",
++			  "lr", "ctr", "xer", "cr0", "cr1", "cr5", "cr6", "cr7", "memory"
+ 		);
+ 		return result;
+ 	}
+diff --git a/ppu/librsx/buffer_impl.h b/ppu/librsx/buffer_impl.h
+index bb13d0c..b6aaf93 100644
+--- a/ppu/librsx/buffer_impl.h
++++ b/ppu/librsx/buffer_impl.h
+@@ -1,13 +1,31 @@
++/**
++ * @brief Resets the RSX command ring buffer and rewinds host write pointer.
++ *
++ * Emits a hardware JUMP command directing RSX FIFO execution back to the base
++ * offset (0x1000) within the mapped host IO area. Waits until the RSX GET pointer
++ * acknowledges the jump, then rewinds context->current back to context->begin so
++ * subsequent CPU command emissions resume cleanly from the start of the buffer.
++ *
++ * @param context Pointer to active gcmContextData structure.
++ */
+ void RSX_FUNC(ResetCommandBuffer)(gcmContextData *context)
+ {
+-	u32 offset = 0x1000;			// init state offset;
+-	RSX_FUNC(SetJumpCommand)(context,offset);
++	u32 offset = 0;
++	if (gcmAddressToOffset(context->begin, &offset) != 0)
++		offset = 0x1000;
+ 
+-	__sync();
++	RSX_FUNC(SetJumpCommand)(context, offset);
++
++	/* Flush the jump command so RSX FIFO executes up to and through the jump */
++	RSX_FUNC(FlushBuffer)(context);
+ 
+ 	gcmControlRegister volatile *ctrl = gcmGetControlRegister(context);
++	while(ctrl->get != offset) usleep(30);
++
+ 	ctrl->put = offset;
+-	while(ctrl->get!=offset) usleep(30);
++
++	/* Synchronize host write pointer back to the buffer start */
++	context->current = context->begin;
+ }
+ 
+ void RSX_FUNC(FlushBuffer)(gcmContextData *context)
+diff --git a/ppu/librsx/commands_impl.h b/ppu/librsx/commands_impl.h
+index 3c6e0d6..7ed984d 100644
+--- a/ppu/librsx/commands_impl.h
++++ b/ppu/librsx/commands_impl.h
+@@ -215,7 +215,7 @@ void RSX_FUNC(SetViewport)(gcmContextData *context,u16 x,u16 y,u16 width,u16 hei
+ 	_offset[2].f = offset[2];
+ 	_offset[3].f = offset[3];
+ 
+-	RSX_CONTEXT_CURRENT_BEGIN(24);
++	RSX_CONTEXT_CURRENT_BEGIN(15);
+ 
+ 	RSX_CONTEXT_CURRENTP[0] = RSX_METHOD(NV40TCL_VIEWPORT_HORIZ,2);
+ 	RSX_CONTEXT_CURRENTP[1] = ((width<<16) | x);
+@@ -235,17 +235,7 @@ void RSX_FUNC(SetViewport)(gcmContextData *context,u16 x,u16 y,u16 width,u16 hei
+ 	RSX_CONTEXT_CURRENTP[13] = _scale[2].u;
+ 	RSX_CONTEXT_CURRENTP[14] = _scale[3].u;
+ 
+-	RSX_CONTEXT_CURRENTP[15] = RSX_METHOD(NV40TCL_VIEWPORT_OFFSET,8);
+-	RSX_CONTEXT_CURRENTP[16] = _offset[0].u;
+-	RSX_CONTEXT_CURRENTP[17] = _offset[1].u;
+-	RSX_CONTEXT_CURRENTP[18] = _offset[2].u;
+-	RSX_CONTEXT_CURRENTP[19] = _offset[3].u;
+-	RSX_CONTEXT_CURRENTP[20] = _scale[0].u;
+-	RSX_CONTEXT_CURRENTP[21] = _scale[1].u;
+-	RSX_CONTEXT_CURRENTP[22] = _scale[2].u;
+-	RSX_CONTEXT_CURRENTP[23] = _scale[3].u;
+-
+-	RSX_CONTEXT_CURRENT_END(24);
++	RSX_CONTEXT_CURRENT_END(15);
+ }
+ 
+ void RSX_FUNC(SetViewportClip)(gcmContextData *context,u8 sel,u16 width,u16 height)
+@@ -661,7 +651,7 @@ void RSX_FUNC(LoadFragmentProgramLocation)(gcmContextData *context,const rsxFrag
+ 	texcoords = program->texcoords;
+ 	texcoord2D = program->texcoord2D;
+ 	texcoord3D = program->texcoord3D;
+-	for(i=0;texcoords;i++) {
++	for(i=0; i<8 && texcoords; i++) {
+ 		if(texcoords&1) {
+ 			RSX_CONTEXT_CURRENT_BEGIN(2);
+ 			RSX_CONTEXT_CURRENTP[0] = RSX_METHOD(NV40TCL_TEX_COORD_CONTROL(i),1);
+@@ -676,6 +666,8 @@ void RSX_FUNC(LoadFragmentProgramLocation)(gcmContextData *context,const rsxFrag
+ 	{
+ 		u32 num_regs = program->num_regs > 2 ? program->num_regs : 2;
+ 		u32 fpcontrol = program->fp_control | (num_regs << NV40TCL_FP_CONTROL_TEMP_COUNT_SHIFT) | (1<<10);
++		if(program->texcoords)
++			fpcontrol |= (1 << 15);
+ 
+ 		RSX_CONTEXT_CURRENT_BEGIN(2);
+ 		RSX_CONTEXT_CURRENTP[0] = RSX_METHOD(NV40TCL_FP_CONTROL,1);
+@@ -816,7 +808,7 @@ void RSX_FUNC(SetVertexProgramConstants)(gcmContextData *context,u32 start,u32 c
+ 		RSX_CONTEXT_CURRENTP[1] = loadAt;
+ 
+ 		RSX_MEMCPY(&RSX_CONTEXT_CURRENTP[2],value,sizeof(f32)*16);
+-		RSX_MEMCPY(&RSX_CONTEXT_CURRENTP[18],value,sizeof(f32)*16);
++		RSX_MEMCPY(&RSX_CONTEXT_CURRENTP[18],&value[16],sizeof(f32)*16);
+ 		RSX_CONTEXT_CURRENTP += 34;
+ 		value += 32;
+ 	}
+@@ -824,13 +816,8 @@ void RSX_FUNC(SetVertexProgramConstants)(gcmContextData *context,u32 start,u32 c
+ 	if (rest) {
+ 		RSX_CONTEXT_CURRENTP[0] = RSX_METHOD(NV40TCL_VP_UPLOAD_CONST_ID,rest + 1);
+ 		RSX_CONTEXT_CURRENTP[1] = start + (loop<<3);
+-		RSX_CONTEXT_CURRENTP += 2;
+-
+-		for(i=0;i < rest;i++) {
+-			RSX_CONTEXT_CURRENTP[0] = *value;
+-			RSX_CONTEXT_CURRENTP++;
+-			value++;
+-		}
++		RSX_MEMCPY(&RSX_CONTEXT_CURRENTP[2],value,sizeof(f32)*rest);
++		RSX_CONTEXT_CURRENTP += 2 + rest;
+ 	}
+ 
+ 	RSX_CONTEXT_CURRENT_END(reserve);
+@@ -2261,7 +2248,7 @@ void RSX_FUNC(SetTimeStamp)(gcmContextData *context,u32 index)
+ 	RSX_CONTEXT_CURRENT_BEGIN(2);
+ 
+ 	RSX_CONTEXT_CURRENTP[0] = RSX_METHOD(NV40TCL_QUERY_GET,1);
+-	RSX_CONTEXT_CURRENTP[2] = (((index << 4)&0x0fffffff) | 0x10000000);
++	RSX_CONTEXT_CURRENTP[1] = (((index << 4)&0x0fffffff) | 0x10000000);
+ 
+ 	RSX_CONTEXT_CURRENT_END(2);
+ }
+diff --git a/ppu/librsx/init.c b/ppu/librsx/init.c
+index d6de8a1..fa673e3 100644
+--- a/ppu/librsx/init.c
++++ b/ppu/librsx/init.c
+@@ -20,6 +20,11 @@ s32 rsxInit(gcmContextData **context,u32 cmdSize,u32 ioSize,const void *ioAddres
+ 
+ 	ret = gcmInitBodyEx(&gGcmContext,cmdSize,ioSize,ioAddress);
+ 	if(ret==0) {
++		u32 maxCmdSize = (ioSize > 0x1000) ? (ioSize - 0x1000) : 0;
++		if(cmdSize > 0x7000 && cmdSize <= maxCmdSize && gGcmContext != NULL) {
++			gGcmContext->end = (u32*)((uintptr_t)(void*)gGcmContext->begin + (cmdSize & ~0x3) - 4);
++		}
++
+ 		rsxHeapInit();
+ 
+ 		if (context)
+@@ -28,13 +33,27 @@ s32 rsxInit(gcmContextData **context,u32 cmdSize,u32 ioSize,const void *ioAddres
+ 	return ret;
+ }
+ 
++/**
++ * @brief Configures GCM context buffer pointers and registers wrap callback.
++ *
++ * @param context Pointer to destination gcmContextData structure.
++ * @param addr Start address of the mapped command FIFO buffer.
++ * @param size Total allocated byte size of the command buffer.
++ * @param cb User-defined callback invoked when buffer reaches end.
++ */
+ void rsxSetupContextData(gcmContextData *context,const u32 *addr,u32 size,gcmContextCallback cb)
+ {
+ 	u32 alignedSize = size&~0x3;
+ 
+ 	context->begin = (u32*)addr;
+ 	context->current = (u32*)addr;
+-	context->end = (u32*)(addr + alignedSize - 4);
++	/*
++	 * Explicitly cast addr to uintptr_t (or u64) before adding the alignedSize byte
++	 * count. Because addr is typed as 'const u32*', standard C pointer arithmetic
++	 * (addr + alignedSize) would scale alignedSize by sizeof(u32) (4x multiplication),
++	 * overflowing 4x beyond the allocated buffer and bypassing boundary checks.
++	 */
++	context->end = (u32*)((uintptr_t)addr + alignedSize - 4);
+ 	context->callback = (gcmContextCallback)__get_opd32(cb);
+ }
+ 
+@@ -72,7 +91,10 @@ void rsxSetDefaultCommandBuffer(gcmContextData **context)
+  */
+ void rsxSetUserCallback(gcmContextCallback cb)
+ {
+-	sUserContext.callback = (gcmContextCallback)__get_opd32(cb);
++	gcmContextCallback cb32 = (gcmContextCallback)__get_opd32(cb);
++	sUserContext.callback = cb32;
++	if(gGcmContext != NULL)
++		gGcmContext->callback = cb32;
+ }
+ 
+ u32* rsxGetCurrentBuffer()
+diff --git a/tools/cgcomp/source/compilerfp.cpp b/tools/cgcomp/source/compilerfp.cpp
+index b0d7e31..b3d34c1 100644
+--- a/tools/cgcomp/source/compilerfp.cpp
++++ b/tools/cgcomp/source/compilerfp.cpp
+@@ -732,6 +732,7 @@ void CCompilerFP::emit_txl(struct nvfx_insn *insn)
+ 	hw[0] |= (insn->tex_unit << NVFX_FP_OP_TEX_UNIT_SHIFT);
+ 
+ 	m_nSamplers |= (1<<insn->tex_unit);
++	m_nFPControl |= 0x8000;
+ }
+ 
+ void CCompilerFP::emit_tex(struct nvfx_insn *insn,u8 op)
+@@ -746,6 +747,7 @@ void CCompilerFP::emit_tex(struct nvfx_insn *insn,u8 op)
+ 	hw[0] |= (insn->tex_unit << NVFX_FP_OP_TEX_UNIT_SHIFT);
+ 
+ 	m_nSamplers |= (1<<insn->tex_unit);
++	m_nFPControl |= 0x8000;
+ }
+ 
+ struct nvfx_reg CCompilerFP::imm(f32 x, f32 y, f32 z, f32 w)
+-- 
+2.56.0
+

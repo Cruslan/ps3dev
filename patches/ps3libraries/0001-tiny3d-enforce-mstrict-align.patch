@@ -1,0 +1,36 @@
+From 99887766554433221100aabbccddeeff00112233 Mon Sep 17 00:00:00 2001
+From: Cruslan <147114339+Cruslan@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 19:35:00 +0300
+Subject: [PATCH] tiny3d: enforce -mstrict-align to prevent Cell PPE unaligned stdx hardware traps
+
+Without -mstrict-align, GCC 13 optimizes 12-byte float vertex writes in
+tiny3d.c into 64-bit stdx instructions. Because rsx_vertex is mapped to RSX
+I/O memory, unaligned 64-bit stdx stores trigger an unrecoverable Alignment
+Exception / Data Storage Interrupt on Cell PPE, freezing the console with
+a black screen. This patch adds -mstrict-align to CFLAGS in tiny3d lib/Makefile.
+---
+diff --git a/patches/tiny3d-mstrict-align.patch b/patches/tiny3d-mstrict-align.patch
+new file mode 100644
+index 0000000..480dfff
+--- /dev/null
++++ b/patches/tiny3d-mstrict-align.patch
+@@ -0,0 +1,5 @@
++--- a/lib/Makefile
+++++ b/lib/Makefile
++@@ -39,1 +39,1 @@
++-CFLAGS		+= -O2 -Wall -mcpu=cell -fgnu89-inline $(MACHDEP) -fno-strict-aliasing $(INCLUDES)
+++CFLAGS		+= -O2 -Wall -mcpu=cell -mstrict-align -fgnu89-inline $(MACHDEP) -fno-strict-aliasing $(INCLUDES)
+diff --git a/scripts/027-tiny3d_libfont.sh b/scripts/027-tiny3d_libfont.sh
+index 141f697..eb7cc28 100644
+--- a/scripts/027-tiny3d_libfont.sh
++++ b/scripts/027-tiny3d_libfont.sh
+@@ -23,6 +23,9 @@ echo "Unpacking tiny3d"
+ extract ../archives/tiny3d.tar.gz --strip-components=1 --directory=tiny3d
+ cd tiny3d
+ 
++## Apply patches.
++cat ../../patches/tiny3d-mstrict-align.patch | patch -p1
++
+ ## Compile and install.
+ ${MAKE:-make} -j"$jobs" install -C lib --no-print-directory
+ ${MAKE:-make} -j"$jobs" install -C libfont --no-print-directory

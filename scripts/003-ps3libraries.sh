@@ -16,6 +16,10 @@ checkout_repository \
     "$PS3LIBRARIES_REF" \
     "$PS3LIBRARIES_SOURCE_DIR"
 
+apply_patches \
+    "$PS3DEV_ROOT_DIR/patches/ps3libraries" \
+    "$PS3LIBRARIES_SOURCE_DIR"
+
 heading "Building ps3libraries"
 
 (

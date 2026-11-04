@@ -1,0 +1,39 @@
+From 03a2c1067231a61514e072cd6cffba2a57c44689 Mon Sep 17 00:00:00 2001
+From: Cruslan <147114339+Cruslan@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 23:59:07 +0300
+Subject: [PATCH 1/2] librsx: wrap user callback in __get_opd32 to fix crash on
+ command buffer wrap
+
+---
+ ppu/librsx/init.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/ppu/librsx/init.c b/ppu/librsx/init.c
+index 79a32f6..d6de8a1 100644
+--- a/ppu/librsx/init.c
++++ b/ppu/librsx/init.c
+@@ -59,9 +59,20 @@ void rsxSetDefaultCommandBuffer(gcmContextData **context)
+ 		*context = gGcmContext;
+ }
+ 
++/**
++ * @brief Sets user context callback handler for GCM command buffer wrap.
++ *
++ * In PowerPC 64-bit ELF ABI, C function pointers reference 24-byte 64-bit Procedure
++ * Descriptors (OPD). However, rsxContextCallback in rsx_function_macros.h uses 32-bit
++ * word loads (lwz 0, 0(%3); lwz 2, 4(%3)) expecting a 32-bit OPD descriptor layout.
++ * We must explicitly transform the handler pointer via __get_opd32 to ensure the entry
++ * point and TOC register are properly populated, preventing CTR=0 crashes on ring wrap.
++ *
++ * @param cb Function pointer to user-defined gcmContextCallback handler.
++ */
+ void rsxSetUserCallback(gcmContextCallback cb)
+ {
+-	sUserContext.callback = cb;
++	sUserContext.callback = (gcmContextCallback)__get_opd32(cb);
+ }
+ 
+ u32* rsxGetCurrentBuffer()
+-- 
+2.56.0
+

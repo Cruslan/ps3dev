@@ -17,6 +17,10 @@ checkout_repository \
     "$PSL1GHT_REF" \
     "$PSL1GHT_SOURCE_DIR"
 
+apply_patches \
+    "$PS3DEV_ROOT_DIR/patches/PSL1GHT" \
+    "$PSL1GHT_SOURCE_DIR"
+
 heading "Building PSL1GHT"
 
 (

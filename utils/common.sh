@@ -89,3 +89,23 @@ host_asset_arch() {
             ;;
     esac
 }
+
+apply_patches() {
+    local patch_dir="$1"
+    local target_dir="$2"
+
+    if [[ -d "$patch_dir" ]]; then
+        local patch_file
+        for patch_file in "$patch_dir"/*.patch; do
+            [[ -f "$patch_file" ]] || continue
+            heading "Applying $(basename "$patch_file") to $(basename "$target_dir")"
+            if git -C "$target_dir" apply --check "$patch_file" >/dev/null 2>&1; then
+                git -C "$target_dir" apply "$patch_file"
+            else
+                patch -d "$target_dir" -p1 --forward < "$patch_file" || {
+                    printf "Warning: %s could not be cleanly applied (may already be merged).\n" "$(basename "$patch_file")"
+                }
+            fi
+        done
+    fi
+}
